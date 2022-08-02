@@ -3,14 +3,11 @@ package xmrtaker
 import (
 	"context"
 	"encoding/hex"
-	"math/big"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
-	ethcrypto "github.com/ethereum/go-ethereum/crypto"
-	"github.com/ethereum/go-ethereum/ethclient"
 
 	"github.com/noot/atomic-swap/common"
 	"github.com/noot/atomic-swap/common/types"
@@ -41,18 +38,17 @@ func (n *mockNet) SendSwapMessage(msg net.Message, _ types.Hash) error {
 }
 
 func newBackend(t *testing.T) backend.Backend {
-	pk, err := ethcrypto.HexToECDSA(tests.GetTakerTestKey(t))
+	pk := tests.GetTakerTestKey(t)
+	ec, chainID := tests.NewEthClient(t)
+	ctx := context.Background()
+
+	txOpts, err := bind.NewKeyedTransactorWithChainID(pk, chainID)
 	require.NoError(t, err)
 
-	ec, err := ethclient.Dial(common.DefaultEthEndpoint)
+	_, tx, contract, err := swapfactory.DeploySwapFactory(txOpts, ec)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		ec.Close()
-	})
 
-	txOpts, err := bind.NewKeyedTransactorWithChainID(pk, big.NewInt(common.DevelopmentConfig.EthereumChainID))
-	require.NoError(t, err)
-	addr, _, contract, err := swapfactory.DeploySwapFactory(txOpts, ec)
+	addr, err := bind.WaitDeployed(ctx, ec, tx)
 	require.NoError(t, err)
 
 	bcfg := &backend.Config{
@@ -62,7 +58,7 @@ func newBackend(t *testing.T) backend.Backend {
 		EthereumClient:       ec,
 		EthereumPrivateKey:   pk,
 		Environment:          common.Development,
-		ChainID:              big.NewInt(common.DevelopmentConfig.EthereumChainID),
+		ChainID:              chainID,
 		SwapManager:          pswap.NewManager(),
 		SwapContract:         contract,
 		SwapContractAddress:  addr,
@@ -75,14 +71,10 @@ func newBackend(t *testing.T) backend.Backend {
 }
 
 func newXMRMakerBackend(t *testing.T) backend.Backend {
-	pk, err := ethcrypto.HexToECDSA(tests.GetMakerTestKey(t))
-	require.NoError(t, err)
+	pk := tests.GetMakerTestKey(t)
+	ec, chainID := tests.NewEthClient(t)
 
-	ec, err := ethclient.Dial(common.DefaultEthEndpoint)
-	require.NoError(t, err)
-	defer ec.Close()
-
-	txOpts, err := bind.NewKeyedTransactorWithChainID(pk, big.NewInt(common.DevelopmentConfig.EthereumChainID))
+	txOpts, err := bind.NewKeyedTransactorWithChainID(pk, chainID)
 	require.NoError(t, err)
 	addr, _, contract, err := swapfactory.DeploySwapFactory(txOpts, ec)
 	require.NoError(t, err)
@@ -94,7 +86,7 @@ func newXMRMakerBackend(t *testing.T) backend.Backend {
 		EthereumClient:       ec,
 		EthereumPrivateKey:   pk,
 		Environment:          common.Development,
-		ChainID:              big.NewInt(common.DevelopmentConfig.EthereumChainID),
+		ChainID:              chainID,
 		SwapManager:          pswap.NewManager(),
 		SwapContract:         contract,
 		SwapContractAddress:  addr,
@@ -313,7 +305,7 @@ func TestSwapState_NotifyClaimed(t *testing.T) {
 	require.NoError(t, err)
 
 	// mine some blocks to get xmr first
-	err = maker.GenerateBlocks(xmrmakerAddr.Address, 121)
+	err = maker.GenerateBlocks(xmrmakerAddr.Address, 256)
 	require.NoError(t, err)
 	err = maker.Refresh()
 	require.NoError(t, err)
@@ -322,9 +314,10 @@ func TestSwapState_NotifyClaimed(t *testing.T) {
 	xmrAddr := kp.Address(common.Mainnet)
 
 	// lock xmr
-	_, err = maker.Transfer(xmrAddr, 0, uint(amt))
+	tResp, err := maker.Transfer(xmrAddr, 0, uint(amt))
 	require.NoError(t, err)
-	t.Log("transferred to account", xmrAddr)
+	t.Logf("transferred %d pico XMR (fees %d) to account %s", tResp.Amount, tResp.Fee, xmrAddr)
+	require.Equal(t, uint(amt), tResp.Amount)
 
 	_ = maker.GenerateBlocks(xmrmakerAddr.Address, 100)
 
@@ -352,6 +345,7 @@ func TestSwapState_NotifyClaimed(t *testing.T) {
 	require.NoError(t, err)
 	tx, err := s.Contract().Claim(txOpts, s.contractSwap, sc)
 	require.NoError(t, err)
+	tests.MineTransaction(t, s, tx)
 
 	// handled the claimed message should result in the monero wallet being created
 	cmsg := &message.NotifyClaimed{
